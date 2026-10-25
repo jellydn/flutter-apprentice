@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+tools="$HOME/.local/share/flutter-apprentice"
+scratch="$(mktemp -d)"
+trap 'rm -rf -- "$scratch"' EXIT
+
+log() {
+    printf '[%ss] %s\n' "$SECONDS" "$*"
+}
+
+if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
+    echo 'This setup supports Linux x86_64 orbs only.' >&2
+    exit 1
+fi
+
+log 'Checking system packages'
+missing=()
+for package in ca-certificates curl git unzip xz-utils python3 libgl1; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+download() {
+    local url="$1" checksum="$2" destination="$3"
+    curl --fail --location --silent --show-error --retry 3 "$url" -o "$destination"
+    printf '%s  %s\n' "$checksum" "$destination" | sha256sum --check --status
+}
+
+mkdir -p "$tools"
+log 'Installing Temurin JDK 11.0.32.1+1'
+if [[ ! -x "$tools/jdk-11.0.32.1+1/bin/java" ]]; then
+    download \
+        'https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.32.1%2B1/OpenJDK11U-jdk_x64_linux_hotspot_11.0.32.1_1.tar.gz' \
+        '5c3f68887c325d36d852ba534303e1f5f1f5cae7d6cc1e951d73e0d8e98a058d' \
+        "$scratch/jdk.tar.gz"
+    tar -xzf "$scratch/jdk.tar.gz" -C "$tools"
+fi
+
+log 'Installing Flutter 2.2.3 (Dart 2.13.4)'
+if [[ ! -x "$tools/flutter-2.2.3/bin/flutter" ]]; then
+    download \
+        'https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_2.2.3-stable.tar.xz' \
+        '66a271aa9f4286596841f5c89fd5d22e4ae0042127459e88d5650ca989ba948d' \
+        "$scratch/flutter.tar.xz"
+    tar -xf "$scratch/flutter.tar.xz" -C "$scratch"
+    mv "$scratch/flutter" "$tools/flutter-2.2.3"
+fi
+
+log 'Installing Gradle 6.7'
+if [[ ! -x "$tools/gradle-6.7/bin/gradle" ]]; then
+    download \
+        'https://services.gradle.org/distributions/gradle-6.7-bin.zip' \
+        '8ad57759019a9233dc7dc4d1a530cefe109dc122000d57f7e623f8cf4ba9dfc4' \
+        "$scratch/gradle.zip"
+    unzip -q "$scratch/gradle.zip" -d "$tools"
+fi
+
+log 'Installing Android command-line tools 9.0 (runs on JDK 11)'
+if [[ ! -x "$tools/android-sdk/cmdline-tools/9.0/bin/sdkmanager" ]]; then
+    download \
+        'https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip' \
+        'bd1aa17c7ef10066949c88dc6c9c8d536be27f992a1f3b5a584f9bd2ba5646a0' \
+        "$scratch/android.zip"
+    unzip -q "$scratch/android.zip" -d "$scratch/android"
+    mkdir -p "$tools/android-sdk/cmdline-tools"
+    mv "$scratch/android/cmdline-tools" "$tools/android-sdk/cmdline-tools/9.0"
+fi
+
+export JAVA_HOME="$tools/jdk-11.0.32.1+1"
+export FLUTTER_ROOT="$tools/flutter-2.2.3"
+export ANDROID_SDK_ROOT="$tools/android-sdk"
+export ANDROID_HOME="$ANDROID_SDK_ROOT"
+tool_path="$FLUTTER_ROOT/bin:$JAVA_HOME/bin:$tools/gradle-6.7/bin:$ANDROID_SDK_ROOT/cmdline-tools/9.0/bin:$ANDROID_SDK_ROOT/platform-tools"
+export PATH="$tool_path:$PATH"
+
+log 'Installing Android SDK platform 30, build-tools 29.0.2, and platform-tools'
+if [[ ! -f "$ANDROID_SDK_ROOT/platforms/android-30/package.xml" ||
+      ! -f "$ANDROID_SDK_ROOT/build-tools/29.0.2/package.xml" ||
+      ! -f "$ANDROID_SDK_ROOT/platform-tools/package.xml" ]]; then
+    sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses < <(yes) >/dev/null
+    sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+        'platforms;android-30' 'build-tools;29.0.2' 'platform-tools'
+fi
+
+log 'Persisting the repository-scoped login environment'
+{
+    printf 'export JAVA_HOME=%q\n' "$JAVA_HOME"
+    printf 'export FLUTTER_ROOT=%q\n' "$FLUTTER_ROOT"
+    printf 'export ANDROID_SDK_ROOT=%q\n' "$ANDROID_SDK_ROOT"
+    printf 'export ANDROID_HOME=%q\n' "$ANDROID_HOME"
+    printf 'if [[ "$PATH" != %q && "$PATH" != %q:* ]]; then\n' "$tool_path" "$tool_path"
+    printf '    export PATH=%q:"$PATH"\n' "$tool_path"
+    printf 'fi\n'
+} > "$tools/env.sh"
+profile_marker="# Flutter Apprentice orb environment: $repo_root"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+    {
+        printf '\n%s\n' "$profile_marker"
+        printf 'if [[ "$PWD" == %q || "$PWD" == %q/* ]]; then\n' "$repo_root" "$repo_root"
+        printf '    source %q\n' "$tools/env.sh"
+        printf 'fi\n'
+    } >> "$HOME/.bash_profile"
+fi
+
+log 'Caching Flutter Android artifacts and recipes dependencies'
+flutter config --no-analytics
+flutter precache --android
+# This SDK selects older flutter_test dependencies; do not rewrite the checkout's lockfile.
+mkdir "$scratch/recipes"
+cp "$repo_root/recipes/pubspec.yaml" "$repo_root/recipes/pubspec.lock" "$scratch/recipes/"
+(cd -- "$scratch/recipes" && flutter pub get)
+
+log 'Setup finished; new login shells in this checkout use the pinned toolchain'

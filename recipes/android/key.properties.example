@@ -1,0 +1,7 @@
+# Copy to key.properties. Never commit the completed file or your keystore.
+# Use an absolute path, or a path relative to recipes/android (not android/app).
+# Use forward slashes on Windows. Escape backslashes as required by Java properties.
+storeFile=
+storePassword=
+keyAlias=
+keyPassword=

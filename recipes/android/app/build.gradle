@@ -25,6 +25,17 @@ apply plugin: 'com.android.application'
 apply plugin: 'kotlin-android'
 apply from: "$flutterRoot/packages/flutter_tools/gradle/flutter.gradle"
 
+def signingProperties = new Properties()
+def signingPropertiesFile = rootProject.file('key.properties')
+if (signingPropertiesFile.exists()) {
+    signingPropertiesFile.withInputStream { signingProperties.load(it) }
+}
+def requiredProperties = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']
+def missingProperties = requiredProperties.findAll {
+    !signingProperties.getProperty(it)?.trim()
+}
+def keystorePath = signingProperties.getProperty('storeFile')
+
 android {
     compileSdkVersion 30
 
@@ -49,11 +60,41 @@ android {
         versionName flutterVersionName
     }
 
+    signingConfigs {
+        release {
+            storeFile = keystorePath?.trim() ? rootProject.file(keystorePath) : null
+            storePassword = signingProperties.getProperty('storePassword')
+            keyAlias = signingProperties.getProperty('keyAlias')
+            keyPassword = signingProperties.getProperty('keyPassword')
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
+        }
+    }
+}
+
+// Check the actual release task graph, including aggregate and Flutter builds.
+// Debug builds and IDE sync must not require private release credentials.
+android.applicationVariants.all { variant ->
+    if (variant.buildType.name == 'release') {
+        gradle.taskGraph.whenReady { graph ->
+            if (graph.hasTask(variant.preBuildProvider.get())) {
+                if (missingProperties) {
+                    throw new GradleException(
+                        "Release signing requires android/key.properties with non-empty: " +
+                        missingProperties.join(', ') + ". See recipes/README.md."
+                    )
+                }
+                if (!android.signingConfigs.release.storeFile.isFile()) {
+                    throw new GradleException(
+                        "Release signing requires an existing keystore file. " +
+                        "Check storeFile in android/key.properties. See recipes/README.md."
+                    )
+                }
+            }
         }
     }
 }
